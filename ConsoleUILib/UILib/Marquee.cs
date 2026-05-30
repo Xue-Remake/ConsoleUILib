@@ -1,69 +1,65 @@
 using System;
+using System.Collections.Generic;
+using static System.Collections.Specialized.BitVector32;
 
 namespace ConsoleUILib.UILib
 {
-    public class Marquee : WidgetBase
+    public class Marquee : WidgetBase, ISessionAware
     {
-        private string _content;
-        private int _displayLen;
-        private int _cycle;
-        private readonly ITimeOperator _time;
+        private readonly DataComponent _content;
+        private readonly int _displayLen;
+        private ITimeOperator _time;
         private int _lastOffset = -1;
-
-        public int DisplayLength
-        {
-            get => _displayLen;
-            set
-            {
-                _displayLen = Math.Max(1, value);
-                MarkDirty();
-            }
-        }
+        private int _cycle;
 
         public string Content
         {
-            get => _content;
-            set
-            {
-                _content = value ?? "";
-                _cycle = Math.Max(1, _content.Length);
-                _lastOffset = -1;
-                MarkDirty();
-            }
+            set => _content.Bind(() => value);
         }
 
-        public Marquee(string content, int displayLength, ITimeOperator timeOp)
+        public int DisplayLength => _displayLen;
+
+        public Marquee(string initialContent, int displayLength)
         {
-            _time = timeOp ?? throw new ArgumentNullException(nameof(timeOp));
-            _content = content ?? "";
             _displayLen = Math.Max(1, displayLength);
-            _cycle = Math.Max(1, _content.Length);
+            _content = new DataComponent(() => initialContent);
+            _cycle = Math.Max(1, initialContent.Length);
         }
 
-        public override void Print()
+        public void OnAttached(Session session) => _time = session;
+        public void OnDetached(Session session) => _time = null;
+
+        public override void Bind(Func<object> getter) => _content.Bind(getter);
+
+        protected override IEnumerable<IBindableComponent> GetComponents()
         {
+            yield return _content;
+        }
+
+        public override void Update()
+        {
+            base.Update(); // 检查内容组件是否变化
+            if (_time == null) return;
+
+            // 还要检查时间偏移变化
+            string val = _content.GetValue()?.ToString() ?? "";
+            _cycle = Math.Max(1, val.Length);
             int offset = _time.GetTick() % _cycle;
-            string looped = _content + _content;
-            Console.WriteLine(looped.Substring(offset, Math.Min(_displayLen, _content.Length)));
+            if (offset != _lastOffset)
+            {
+                _lastOffset = offset;
+                IsDirty = true;
+            }
         }
 
         public override void Print(ICanvas canvas)
         {
             if (!Visible) return;
-            int offset = _time.GetTick() % _cycle;
-            string looped = _content + _content;
-            canvas.WriteLine(looped.Substring(offset, Math.Min(_displayLen, _content.Length)));
-            _lastOffset = offset;
-        }
-
-        public override void Update()
-        {
-            // 由 Session 在每个 tick 调用，检查偏移是否变化
-            int offset = _time.GetTick() % _cycle;
-            if (offset != _lastOffset)
-            {
-                MarkDirty(); // 存在变化，请求重绘
-            }
+            string val = _content.GetValue()?.ToString() ?? "";
+            int offset = _lastOffset;
+            string looped = val + val;
+            string display = looped.Substring(offset, Math.Min(_displayLen, val.Length));
+            canvas.WriteLine(display);
         }
     }
 }

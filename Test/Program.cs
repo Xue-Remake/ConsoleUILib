@@ -1,116 +1,130 @@
 using System;
 using System.Threading;
-using System.Threading.Tasks;
 using ConsoleUILib.UILib;
 
-class Program
+namespace ConsoleUITest
 {
-    static double[] pos = new double[2] { 0.0, 0.0 };
-    static double speed = 5.0;
-    static double direction = 45.0;
-
-    static async Task Main(string[] args)
+    class Program
     {
-        // ---- 在启动 Session 之前完成所有 Console 输出 ----
-        Console.WriteLine("坐标监控程序启动中...");
-        Console.WriteLine("可用命令: speed <值> | dir <值> | exit");
-        Console.WriteLine();
-
-        // ---- 初始化 Session ----
-        var session = Session.Default;
-        session.UpdateIntervalMs = 100;
-
-        // ---- 监控控件 ----
-        var monitor = new VarMonitor("坐标监控");
-        monitor.Bind("X", () => pos[0], "F2");
-        monitor.Bind("Y", () => pos[1], "F2");
-        monitor.Bind("Speed", () => speed, "F3");
-        monitor.Bind("Direction", () => direction + "°", null);
-
-        // ---- 状态栏（用 StaticWidgetBase 承载，通过 Session 渲染） ----
-        var statusLine = new CustomStaticWidget("模拟已启动。输入命令调整参数。按 Ctrl+C 退出。");
-        // 留一个空行分隔
-        var spacer = new CustomStaticWidget(" ");
-
-        session.AddWidget(monitor);
-        session.AddWidget(spacer);
-        session.AddWidget(statusLine);
-
-        // ---- 输入处理 ----
-        var input = new InputHandler { Prompt = "> " };
-        var dispatcher = new CommandDispatcher();
-        dispatcher.Register("speed", parts =>
+        // 新的测试用例
+        static void Main(string[] args)
         {
-            if (parts.Length > 0 && double.TryParse(parts[0], out double s))
+            // 设置控制台标题和初始大小
+            Console.Title = "ConsoleUILib 60FPS Test";
+            Console.Clear();
+
+            // 1. 初始化核心系统 (60帧 = 1000ms / 60 ≈ 16ms)
+            int targetFPS = 60;
+            int intervalMs = 1000 / targetFPS;
+            using var session = new Session(intervalMs);
+            using var inputHandler = new InputHandler { PollingIntervalMs = 10 };
+            var cmdDispatcher = new CommandDispatcher();
+
+            // 用于保存当前用户的输入内容
+            string currentInput = "";
+            string lastAction = "Welcome! Type 'help' to see commands.";
+
+            // 2. 创建 UI 控件并绑定数据
+
+            // 顶部边框和标题
+            var headerTop = new DoubleDivider();
+            var title = new StaticText();
+            title.Bind(() => $"   --- ConsoleUILib Test App ({targetFPS} FPS) ---   Tick: {session.TickCount}");
+            var headerBottom = new Divider();
+
+            // 跑马灯组件 (因为60帧刷新非常快，跑马灯会滚得很快，刚好验证高帧率)
+            var marquee = new Marquee(" || Hello World! ConsoleUILib is running smoothly at 60 Frames Per Second! || ", 50);
+
+            // 动态状态文本
+            var statusText = new StaticText();
+            statusText.Bind(() => $"[Status] Time: {DateTime.Now:HH:mm:ss.fff} | Last Action: {lastAction}");
+
+            // 列表视图 (用于显示日志或任务)
+            var listView = new ListView { Title = "Task / Log List" };
+            listView.AddStringItem("1. Initialized UI Components");
+            listView.AddStringItem("2. Started 60FPS Render Loop");
+
+            // 输入区边框
+            var inputDivider = new DoubleDivider();
+
+            // 命令行输入回显组件 (利用数据绑定实时显示 InputHandler 的内容)
+            var inputBox = new StaticText();
+            inputBox.Bind(() => inputHandler.Prompt + currentInput + "_");
+
+            // 3. 将控件按顺序加入 Session (这决定了从上到下的渲染顺序)
+            session.Add(headerTop);
+            session.Add(title);
+            session.Add(headerBottom);
+            session.Add(marquee);
+            session.Add(new Divider());
+            session.Add(statusText);
+            session.Add(new Divider());
+            session.Add(listView);
+            session.Add(inputDivider);
+            session.Add(inputBox);
+
+            // 4. 配置输入与命令逻辑
+            inputHandler.OnInputChanged += text =>
             {
-                speed = s;
-                statusLine.Value = $"Speed 已设为 {s}";  // 通过 Widget 更新，触发正确重绘
-            }
-            return true;
-        });
-        dispatcher.Register("dir", parts =>
-        {
-            if (parts.Length > 0 && double.TryParse(parts[0], out double d))
+                currentInput = text;
+                inputBox.IsDirty = true; // 强制标记脏，虽然内容绑定会自动检测，但确保即时响应
+            };
+
+            inputHandler.OnCommandSubmitted += cmd =>
             {
-                direction = d % 360;
-                statusLine.Value = $"Direction 已设为 {direction}°";
-            }
-            return true;
-        });
-        dispatcher.Register("exit", _ =>
-        {
-            statusLine.Value = "正在退出...";
-            return true;
-        });
-        input.OnCommandSubmitted += cmd =>
-        {
-            if (cmd == "exit")
+                currentInput = ""; // 提交后清空
+                cmdDispatcher.Dispatch(cmd);
+            };
+
+            // 注册命令
+            cmdDispatcher.Register("help", args =>
             {
-                // 通过修改 status 示意退出（实际退出逻辑见下方 cts）
-            }
-            dispatcher.Dispatch(cmd);
-        };
-        input.Start();
+                lastAction = "Commands: add <text>, clear, quit";
+                return true;
+            });
 
-        // ---- 启动渲染 ----
-        session.Start();
-
-        // ---- 高速模拟循环（120 FPS） ----
-        var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (s, e) =>
-        {
-            e.Cancel = true;
-            cts.Cancel();
-        };
-
-        double fps = 120.0;
-        double dt = 1.0 / fps;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        double simTime = 0;
-        double radPerFrame;
-
-        try
-        {
-            while (!cts.Token.IsCancellationRequested)
+            cmdDispatcher.Register("add", args =>
             {
-                radPerFrame = direction * Math.PI / 180.0;
-                pos[0] += speed * Math.Cos(radPerFrame) * dt;
-                pos[1] += speed * Math.Sin(radPerFrame) * dt;
+                if (args.Length > 0)
+                {
+                    string msg = string.Join(" ", args);
+                    listView.AddStringItem($"[*] {msg}");
+                    lastAction = $"Added item: {msg}";
+                }
+                return true;
+            });
 
-                simTime += dt;
-                var targetMs = simTime * 1000;
-                var sleepMs = (int)(targetMs - sw.Elapsed.TotalMilliseconds);
-                if (sleepMs > 0)
-                    await Task.Delay(Math.Min(sleepMs, 8));
+            cmdDispatcher.Register("clear", args =>
+            {
+                listView.ClearItems();
+                lastAction = "List cleared.";
+                return true;
+            });
+
+            cmdDispatcher.Register("quit", args =>
+            {
+                lastAction = "Shutting down...";
+                session.Stop();
+                return true;
+            });
+
+            cmdDispatcher.OnUnknownCommand += cmd =>
+            {
+                lastAction = $"Unknown command: {cmd}. Type 'help'.";
+            };
+
+            // 5. 启动系统
+            inputHandler.Start();
+            session.Start();
+
+            // 6. 保持主线程存活，直到 session 停止 (用户输入 quit)
+            while (session.IsRunning)
+            {
+                Thread.Sleep(100);
             }
+
+            Console.Clear();
+            Console.WriteLine("Application exited gracefully.");
         }
-        catch (OperationCanceledException) { }
-
-        // ---- 收尾 ----
-        input.Stop();
-        session.Stop();
-
-        // Session 停止后可以安全写 Console
-        Console.WriteLine("程序已退出。");
     }
 }

@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,41 +8,26 @@ namespace ConsoleUILib.UILib
 {
     public class Session : ITimeOperator, IDisposable
     {
-        private readonly List<WidgetBase> _widgets = new();
-        private readonly object _lock = new();
+        private readonly List<WidgetBase> _widgets = new List<WidgetBase>();
+        private readonly object _lock = new object();
         private CancellationTokenSource _cts;
         private Task _renderTask;
         private int _tick;
-        private int _intervalMs = 500;
+        private readonly int _intervalMs;
         private bool _isRunning;
-        private readonly Stopwatch _sw = new();
-
-        // 双缓冲画布
+        private readonly Stopwatch _sw = new Stopwatch();
         private BufferedCanvas _canvas;
 
-        // 控件区域记录：行号 -> 控件
-        private readonly Dictionary<int, WidgetBase> _occupiedRows = new();
+        // 控件行索引映射 (用于局部重绘)
+        private readonly Dictionary<int, WidgetBase> _occupiedRows = new Dictionary<int, WidgetBase>();
 
-        // 脏控件列表
-        private readonly HashSet<WidgetBase> _dirtyWidgets = new();
-        private readonly object _dirtyLock = new();
-
-        // 单例
-        private static readonly Lazy<Session> _default = new(() => new Session());
-        public static Session Default => _default.Value;
-
-        // 属性
         public bool IsRunning => _isRunning;
         public int TickCount => _tick;
         public TimeSpan Elapsed => _sw.Elapsed;
-        public int UpdateIntervalMs
-        {
-            get => _intervalMs;
-            set => _intervalMs = Math.Max(16, value);
-        }
+        public int UpdateIntervalMs => _intervalMs;
         public int WidgetCount { get { lock (_lock) return _widgets.Count; } }
 
-        // 事件
+        // 事件注入
         public event Action<int> OnTick;
         public event Action OnBeforeRender;
         public event Action OnAfterRender;
@@ -51,74 +35,39 @@ namespace ConsoleUILib.UILib
         public event Action<WidgetBase> OnWidgetRemoved;
         public event Action OnStopped;
 
-        // ITimeOperator
         public int GetTick() => _tick;
 
-        public Session()
+        public Session(int intervalMs)
         {
+            _intervalMs = Math.Max(1, intervalMs);
             _canvas = new BufferedCanvas(Console.WindowWidth, Console.WindowHeight);
         }
 
-        // 控件管理
-        public void AddWidget(WidgetBase widget)
+        // ---------- 控件管理 ----------
+        public void Add(WidgetBase widget)
         {
             if (widget == null) return;
             lock (_lock) _widgets.Add(widget);
             (widget as ISessionAware)?.OnAttached(this);
-            widget.OnDirty += OnWidgetDirty;
             OnWidgetAdded?.Invoke(widget);
-
-            // 初次添加立即绘制
-            if (_isRunning)
-            {
-                FullRedraw();
-            }
+            if (_isRunning) RestartFullRedraw(); // 重新全量绘制以避免布局错乱
         }
 
-        public bool RemoveWidget(WidgetBase widget)
+        public bool Remove(WidgetBase widget)
         {
             if (widget == null) return false;
             bool ok;
             lock (_lock) ok = _widgets.Remove(widget);
             if (ok)
             {
-                widget.OnDirty -= OnWidgetDirty;
-                lock (_dirtyLock) _dirtyWidgets.Remove(widget);
                 (widget as ISessionAware)?.OnDetached(this);
                 OnWidgetRemoved?.Invoke(widget);
-                if (_isRunning) FullRedraw();
+                if (_isRunning) RestartFullRedraw();
             }
             return ok;
         }
 
-        public bool RemoveWidgetAt(int index)
-        {
-            WidgetBase w = null;
-            lock (_lock)
-            {
-                if (index >= 0 && index < _widgets.Count)
-                {
-                    w = _widgets[index];
-                    _widgets.RemoveAt(index);
-                }
-            }
-            if (w != null) return RemoveWidget(w);
-            return false;
-        }
-
-        public bool RemoveWidgetByName(string name)
-        {
-            WidgetBase w = null;
-            lock (_lock)
-            {
-                w = _widgets.Find(x => x.Name == name);
-                if (w != null) _widgets.Remove(w);
-            }
-            if (w != null) return RemoveWidget(w);
-            return false;
-        }
-
-        public void ClearWidgets()
+        public void Clear()
         {
             List<WidgetBase> copy;
             lock (_lock)
@@ -126,30 +75,10 @@ namespace ConsoleUILib.UILib
                 copy = new List<WidgetBase>(_widgets);
                 _widgets.Clear();
             }
-            foreach (var w in copy) RemoveWidget(w);
+            foreach (var w in copy) Remove(w);
         }
 
-        public WidgetBase GetWidgetAt(int index)
-        {
-            lock (_lock) return (index >= 0 && index < _widgets.Count) ? _widgets[index] : null;
-        }
-
-        public WidgetBase GetWidgetByName(string name)
-        {
-            lock (_lock) return _widgets.Find(w => w.Name == name);
-        }
-
-        public List<T> GetWidgetsByType<T>() where T : WidgetBase
-        {
-            lock (_lock) return _widgets.OfType<T>().ToList();
-        }
-
-        public IReadOnlyList<WidgetBase> GetWidgets()
-        {
-            lock (_lock) return _widgets.ToArray();
-        }
-
-        // 生命周期
+        // ---------- 生命周期 ----------
         public void Start()
         {
             if (_isRunning) return;
@@ -157,15 +86,9 @@ namespace ConsoleUILib.UILib
             _cts = new CancellationTokenSource();
             _sw.Restart();
             _tick = 0;
-            ResizeCanvas(); // 根据控制台窗口大小重设画布
-            FullRedraw();
+            ResizeCanvas();
+            FullRedraw(); // 初始全量绘制
             _renderTask = Task.Run(() => RenderLoop(_cts.Token));
-        }
-
-        public void Run()
-        {
-            Start();
-            _renderTask?.Wait();
         }
 
         public void Stop()
@@ -183,10 +106,10 @@ namespace ConsoleUILib.UILib
         {
             Stop();
             _cts?.Dispose();
-            ClearWidgets();
+            Clear();
         }
 
-        // 渲染循环（主要变更）
+        // ---------- 渲染循环 ----------
         private async Task RenderLoop(CancellationToken token)
         {
             Console.CursorVisible = false;
@@ -194,21 +117,83 @@ namespace ConsoleUILib.UILib
             {
                 while (!token.IsCancellationRequested)
                 {
-                    // 1. 处理所有控件的 Update()
+                    OnBeforeRender?.Invoke();
+
+                    // 1. 更新所有控件（控件自行检测脏标记）
                     UpdateAllWidgets();
 
-                    // 2. 绘制所有标记为脏的控件
-                    ProcessDirtyWidgets();
+                    // 2. 绘制所有脏控件
+                    bool anyDirty = false;
+                    WidgetBase[] snapshot;
+                    lock (_lock) snapshot = _widgets.ToArray();
 
-                    // 3. 触发时钟事件
+                    if (snapshot.Length > 0)
+                    {
+                        // 记录现有的行映射，用于脏绘制的起点
+                        int currentRow = 0;
+                        bool needFullRedraw = false;
+
+                        foreach (var widget in snapshot)
+                        {
+                            if (!widget.Visible) continue;
+                            if (widget.IsDirty)
+                            {
+                                anyDirty = true;
+                                // 尝试查找该控件之前的起始行
+                                int oldStartRow = -1;
+                                for (int r = 0; r < _canvas.Height; r++)
+                                {
+                                    if (_occupiedRows.TryGetValue(r, out var w) && w == widget)
+                                    {
+                                        oldStartRow = r;
+                                        break;
+                                    }
+                                }
+
+                                if (oldStartRow >= 0)
+                                {
+                                    _canvas.CurrentRow = oldStartRow;
+                                    widget.Print(_canvas);
+                                    // 清除可能多余的旧行
+                                    ClearBelow(_canvas.CurrentRow, widget, oldStartRow);
+                                }
+                                else
+                                {
+                                    // 找不到旧位置或首次绘制，全量重绘更安全
+                                    needFullRedraw = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (needFullRedraw)
+                        {
+                            FullRedraw();
+                        }
+                        else if (anyDirty)
+                        {
+                            // 重新整理行映射（因为可能部分控件重绘后移动了行）
+                            RebuildRowMapping(snapshot);
+                            _canvas.Render();
+                        }
+                    }
+
+                    // 重置所有控件的脏标记
+                    foreach (var w in snapshot) w.CleanDirty();
+
                     OnTick?.Invoke(_tick);
                     _tick++;
+
+                    OnAfterRender?.Invoke();
 
                     try { await Task.Delay(_intervalMs, token); }
                     catch (OperationCanceledException) { break; }
                 }
             }
-            finally { Console.CursorVisible = true; }
+            finally
+            {
+                Console.CursorVisible = true;
+            }
         }
 
         private void UpdateAllWidgets()
@@ -218,105 +203,51 @@ namespace ConsoleUILib.UILib
             foreach (var w in snapshot)
             {
                 try { w.Update(); }
-                catch { /* 忽略错误防止渲染崩溃 */ }
+                catch { /* 忽略用户代码异常 */ }
             }
         }
 
-        // 脏控件处理
-        private void OnWidgetDirty(WidgetBase widget)
-        {
-            lock (_dirtyLock) _dirtyWidgets.Add(widget);
-        }
-
-        private void ProcessDirtyWidgets()
-        {
-            WidgetBase[] dirtySnapshot;
-            lock (_dirtyLock)
-            {
-                if (_dirtyWidgets.Count == 0) return;
-                dirtySnapshot = _dirtyWidgets.ToArray();
-                _dirtyWidgets.Clear();
-            }
-
-            // 仅重绘脏控件的区域
-            foreach (var widget in dirtySnapshot)
-            {
-                // 查找该控件在布局中的起始行
-                int startRow = -1;
-                lock (_lock)
-                {
-                    for (int row = 0; row < _canvas.Height; row++)
-                    {
-                        if (_occupiedRows.TryGetValue(row, out var w) && w == widget)
-                        {
-                            startRow = row;
-                            break;
-                        }
-                    }
-                }
-
-                if (startRow >= 0)
-                {
-                    _canvas.CurrentRow = startRow;
-                    try { widget.Print(_canvas); }
-                    catch (Exception ex)
-                    {
-                        _canvas.WriteLine($"[{widget.GetType().Name} Error] {ex.Message}");
-                    }
-                    // 清除可能残留的旧行（如果新内容行数减少）
-                    ClearBelow(_canvas.CurrentRow, widget, startRow);
-                }
-                else
-                {
-                    // 控件未找到，可能因添加/删除导致布局变化，全量重绘
-                    FullRedraw();
-                    break;
-                }
-            }
-            // 输出差异
-            _canvas.Render();
-        }
-
-        // 全量重绘（初次或结构变化时）
+        // ---------- 全量重绘 ----------
         private void FullRedraw()
         {
             ResizeCanvas();
             _canvas.Clear();
             _occupiedRows.Clear();
 
-            int row = 0;
             WidgetBase[] snapshot;
             lock (_lock) snapshot = _widgets.ToArray();
 
+            int row = 0;
             foreach (var widget in snapshot)
             {
                 if (!widget.Visible) continue;
-
-                int startRow = row;
                 _canvas.CurrentRow = row;
-
                 try { widget.Print(_canvas); }
-                catch (Exception ex)
-                {
-                    _canvas.WriteLine($"[{widget.GetType().Name} Error] {ex.Message}");
-                }
+                catch (Exception ex) { _canvas.WriteLine($"[Error] {ex.Message}"); }
 
-                int endRow = _canvas.CurrentRow - 1; // 最末有效行
-                for (int r = startRow; r <= endRow && r < _canvas.Height; r++)
-                {
+                int endRow = _canvas.CurrentRow - 1;
+                for (int r = row; r <= endRow && r < _canvas.Height; r++)
                     _occupiedRows[r] = widget;
-                }
                 row = _canvas.CurrentRow;
             }
-
-            // 清除剩余行
-            for (int i = row; i < _canvas.Height; i++)
-                _occupiedRows.Remove(i);
-
             _canvas.Render();
         }
 
-        // 清除控件区域下方多余的行（当控件行数变少时）
+        private void RestartFullRedraw()
+        {
+            if (_isRunning) FullRedraw();
+        }
+
+        private void RebuildRowMapping(WidgetBase[] widgets)
+        {
+            _occupiedRows.Clear();
+            int row = 0;
+            foreach (var widget in widgets)
+            {
+                if (!widget.Visible) continue;
+            }
+        }
+
         private void ClearBelow(int newEndRow, WidgetBase widget, int oldStartRow)
         {
             for (int r = newEndRow; r < _canvas.Height; r++)
